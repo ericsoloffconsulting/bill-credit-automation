@@ -32,10 +32,10 @@ define(['N/search', 'N/log', 'N/file', 'N/record', 'N/email', 'N/runtime'], func
     };
 
     /**
-     * Main scheduled script execution function
-     * Processes CSV file containing Marcone warranty credit data
-     * @param {Object} context - Script execution context
-     */
+  * Main scheduled script execution function
+  * Processes CSV file containing Marcone warranty credit data
+  * @param {Object} context - Script execution context
+  */
     function execute(context) {
         try {
             // GOVERNANCE: Track starting governance
@@ -71,9 +71,13 @@ define(['N/search', 'N/log', 'N/file', 'N/record', 'N/email', 'N/runtime'], func
                 }
             };
 
-            // Get script parameter for CSV file ID
+            // Get script parameters
             var csvFileId = runtime.getCurrentScript().getParameter({
                 name: 'custscript_csv_file_id'
+            });
+
+            var missingAPAgingFileId = runtime.getCurrentScript().getParameter({
+                name: 'custscript_missing_ap_aging'
             });
 
             if (!csvFileId) {
@@ -83,6 +87,7 @@ define(['N/search', 'N/log', 'N/file', 'N/record', 'N/email', 'N/runtime'], func
 
             log.debug('Script Parameters', {
                 csvFileId: csvFileId,
+                missingAPAgingFileId: missingAPAgingFileId || 'Not provided - processing all OrderNos',
                 maxOrderNos: CONFIG.LIMITS.MAX_ORDERNOS_PER_RUN
             });
 
@@ -110,11 +115,44 @@ define(['N/search', 'N/log', 'N/file', 'N/record', 'N/email', 'N/runtime'], func
                 uniqueOrderNos: parsedData.uniqueOrderNos.length
             });
 
-            stats.totalOrderNos = parsedData.uniqueOrderNos.length;
+            // FILTER: Apply Missing AP Aging filter if parameter provided
+            var filteredOrderNos = parsedData.uniqueOrderNos;
+
+            if (missingAPAgingFileId) {
+                log.audit('Missing AP Aging Filter Enabled', {
+                    missingAPAgingFileId: missingAPAgingFileId,
+                    originalOrderNoCount: parsedData.uniqueOrderNos.length
+                });
+
+                var filterResult = filterByMissingAPAging(parsedData.uniqueOrderNos, missingAPAgingFileId);
+
+                if (filterResult.success) {
+                    filteredOrderNos = filterResult.filteredOrderNos;
+
+                    log.audit('OrderNos Filtered by Missing AP Aging', {
+                        originalCount: parsedData.uniqueOrderNos.length,
+                        filteredCount: filteredOrderNos.length,
+                        removedCount: parsedData.uniqueOrderNos.length - filteredOrderNos.length
+                    });
+                } else {
+                    log.error('Missing AP Aging Filter Failed', {
+                        error: filterResult.error,
+                        fallbackBehavior: 'Processing all OrderNos without filter'
+                    });
+                    // Continue with unfiltered OrderNos
+                }
+            } else {
+                log.debug('Missing AP Aging Filter Not Applied', {
+                    reason: 'Parameter custscript_missing_ap_aging not provided',
+                    processingBehavior: 'Processing all OrderNos from CSV'
+                });
+            }
+
+            stats.totalOrderNos = filteredOrderNos.length;
 
             // Determine OrderNos to process
-            var orderNosToProcess = parsedData.uniqueOrderNos.slice(0, CONFIG.LIMITS.MAX_ORDERNOS_PER_RUN);
-            var remainingOrderNos = parsedData.uniqueOrderNos.slice(CONFIG.LIMITS.MAX_ORDERNOS_PER_RUN);
+            var orderNosToProcess = filteredOrderNos.slice(0, CONFIG.LIMITS.MAX_ORDERNOS_PER_RUN);
+            var remainingOrderNos = filteredOrderNos.slice(CONFIG.LIMITS.MAX_ORDERNOS_PER_RUN);
 
             log.debug('Batch Planning', {
                 totalOrderNos: stats.totalOrderNos,
@@ -306,6 +344,128 @@ define(['N/search', 'N/log', 'N/file', 'N/record', 'N/email', 'N/runtime'], func
     }
 
     /**
+     * Filter OrderNos by matching against Missing AP Aging CSV
+     * Compares OrderNo from main CSV (Column C) against Column A of Missing AP Aging CSV
+     * @param {Array} originalOrderNos - Array of OrderNos from main CSV
+     * @param {number} missingAPAgingFileId - File ID of Missing AP Aging CSV
+     * @returns {Object} Filter result with success flag and filtered OrderNos
+     */
+    function filterByMissingAPAging(originalOrderNos, missingAPAgingFileId) {
+        try {
+            log.debug('Starting Missing AP Aging Filter', {
+                originalOrderNoCount: originalOrderNos.length,
+                missingAPAgingFileId: missingAPAgingFileId
+            });
+
+            // Load and parse Missing AP Aging CSV
+            var missingAPCsv = loadAndParseCSV(missingAPAgingFileId);
+
+            if (!missingAPCsv.success) {
+                log.error('Missing AP Aging CSV Load Failed', {
+                    error: missingAPCsv.error,
+                    fileId: missingAPAgingFileId
+                });
+
+                return {
+                    success: false,
+                    error: 'Failed to load Missing AP Aging CSV: ' + missingAPCsv.error,
+                    filteredOrderNos: originalOrderNos // Return original list on error
+                };
+            }
+
+            log.debug('Missing AP Aging CSV Loaded', {
+                fileName: missingAPCsv.fileName,
+                totalRows: missingAPCsv.totalRows,
+                headers: missingAPCsv.headers
+            });
+
+            // Extract OrderNos from Column A (first column after headers)
+            var missingAPOrderNos = [];
+            var firstColumnHeader = missingAPCsv.headers[0]; // Column A header
+
+            log.debug('Extracting OrderNos from Column A', {
+                columnHeader: firstColumnHeader,
+                totalRows: missingAPCsv.rows.length
+            });
+
+            for (var i = 0; i < missingAPCsv.rows.length; i++) {
+                var row = missingAPCsv.rows[i];
+                var orderNo = row[firstColumnHeader];
+
+                if (orderNo && orderNo.trim()) {
+                    var trimmedOrderNo = orderNo.trim();
+                    if (missingAPOrderNos.indexOf(trimmedOrderNo) === -1) {
+                        missingAPOrderNos.push(trimmedOrderNo);
+                    }
+                }
+            }
+
+            log.debug('Missing AP OrderNos Extracted', {
+                uniqueOrderNos: missingAPOrderNos.length,
+                orderNos: missingAPOrderNos.slice(0, 10) // Log first 10 for verification
+            });
+
+            // Filter original OrderNos - keep only those that exist in Missing AP Aging
+            var filteredOrderNos = [];
+            var removedOrderNos = [];
+
+            for (var i = 0; i < originalOrderNos.length; i++) {
+                var orderNo = originalOrderNos[i];
+
+                if (missingAPOrderNos.indexOf(orderNo) !== -1) {
+                    filteredOrderNos.push(orderNo);
+                } else {
+                    removedOrderNos.push(orderNo);
+                }
+            }
+
+            log.audit('Missing AP Aging Filter Complete', {
+                originalCount: originalOrderNos.length,
+                filteredCount: filteredOrderNos.length,
+                removedCount: removedOrderNos.length,
+                matchRate: ((filteredOrderNos.length / originalOrderNos.length) * 100).toFixed(2) + '%'
+            });
+
+            if (removedOrderNos.length > 0) {
+                log.debug('Removed OrderNos (Not in Missing AP Aging)', {
+                    count: removedOrderNos.length,
+                    orderNos: removedOrderNos.slice(0, 20) // Log first 20
+                });
+            }
+
+            if (filteredOrderNos.length === 0) {
+                log.error('No Matching OrderNos Found', {
+                    originalCount: originalOrderNos.length,
+                    missingAPCount: missingAPOrderNos.length,
+                    warning: 'No OrderNos from main CSV matched Missing AP Aging CSV - verify file contents'
+                });
+            }
+
+            return {
+                success: true,
+                filteredOrderNos: filteredOrderNos,
+                removedOrderNos: removedOrderNos,
+                missingAPOrderNos: missingAPOrderNos,
+                matchCount: filteredOrderNos.length,
+                originalCount: originalOrderNos.length
+            };
+
+        } catch (error) {
+            log.error('Missing AP Aging Filter Error', {
+                error: error.toString(),
+                errorStack: error.stack,
+                fileId: missingAPAgingFileId
+            });
+
+            return {
+                success: false,
+                error: error.toString(),
+                filteredOrderNos: originalOrderNos // Return original list on error
+            };
+        }
+    }
+
+    /**
      * Parse CSV line handling quoted values with commas
      * @param {string} line - CSV line to parse
      * @returns {Array} Array of field values
@@ -344,11 +504,12 @@ define(['N/search', 'N/log', 'N/file', 'N/record', 'N/email', 'N/runtime'], func
     }
 
     /**
-     * Load and parse CSV file from NetSuite file cabinet
-     * Uses string parsing with proper quote handling for CSV files
-     * @param {number} fileId - NetSuite file ID
-     * @returns {Object} Parsed CSV data structure
-     */
+  * Load and parse CSV file from NetSuite file cabinet
+  * Uses string parsing with proper quote handling for CSV files
+  * Handles CSV files with metadata headers - finds actual data header row
+  * @param {number} fileId - NetSuite file ID
+  * @returns {Object} Parsed CSV data structure
+  */
     function loadAndParseCSV(fileId) {
         try {
             log.debug('Loading CSV File', { fileId: fileId });
@@ -364,16 +525,72 @@ define(['N/search', 'N/log', 'N/file', 'N/record', 'N/email', 'N/runtime'], func
 
             // Parse CSV string into structured data
             var lines = fileContents.split('\n');
-            var headers = parseCSVLine(lines[0]);
+
+            // Find the actual header row by looking for common patterns
+            var headerRowIndex = 0;
+            var headers = null;
+
+            for (var i = 0; i < Math.min(lines.length, 10); i++) {
+                var line = lines[i].trim();
+                if (!line) continue;
+
+                var parsedLine = parseCSVLine(line);
+
+                // Look for header row patterns:
+                // 1. Contains "Invoice Number" or "OrderNo" (case-insensitive)
+                // 2. Has multiple non-empty columns
+                // 3. Not empty columns (exclude metadata rows with mostly empty values)
+                var hasInvoiceNumber = false;
+                var hasOrderNo = false;
+                var nonEmptyCount = 0;
+
+                for (var j = 0; j < parsedLine.length; j++) {
+                    var value = parsedLine[j].trim();
+                    if (value) {
+                        nonEmptyCount++;
+                        if (value.toLowerCase().indexOf('invoice number') !== -1 ||
+                            value.toLowerCase() === 'invoice number') {
+                            hasInvoiceNumber = true;
+                        }
+                        if (value.toLowerCase() === 'orderno' ||
+                            value.toLowerCase().indexOf('order') !== -1 && value.toLowerCase().indexOf('no') !== -1) {
+                            hasOrderNo = true;
+                        }
+                    }
+                }
+
+                // Found header row if it has Invoice Number or OrderNo
+                if (hasInvoiceNumber || hasOrderNo) {
+                    headerRowIndex = i;
+                    headers = parsedLine;
+                    log.debug('Header Row Found', {
+                        rowIndex: headerRowIndex,
+                        headerCount: headers.length,
+                        headers: headers
+                    });
+                    break;
+                }
+            }
+
+            // Fallback: If no header row found, use first line (original behavior)
+            if (!headers) {
+                headerRowIndex = 0;
+                headers = parseCSVLine(lines[0]);
+                log.debug('Using First Line as Header (Fallback)', {
+                    headerCount: headers.length,
+                    headers: headers
+                });
+            }
 
             log.debug('CSV Headers Found', {
+                headerRowIndex: headerRowIndex,
                 headerCount: headers.length,
                 headers: headers
             });
 
-            // Parse all data rows
+            // Parse all data rows (starting after header row)
             var rows = [];
-            for (var i = 1; i < lines.length; i++) {
+            for (var i = headerRowIndex + 1; i < lines.length; i++) {
                 var line = lines[i].trim();
                 if (!line) continue; // Skip empty lines
 
@@ -393,20 +610,23 @@ define(['N/search', 'N/log', 'N/file', 'N/record', 'N/email', 'N/runtime'], func
                     rowObj[headers[j]] = values[j] ? values[j].trim() : '';
                 }
 
-                // Only include rows with OrderNo
-                if (rowObj.OrderNo) {
+                // For Missing AP Aging CSV: Check for Invoice Number
+                // For Vendor Order CSV: Check for OrderNo
+                if (rowObj['Invoice Number'] || rowObj.OrderNo) {
                     rows.push(rowObj);
                 }
             }
 
             log.debug('CSV Rows Parsed', { totalRows: rows.length });
 
-            // Extract unique OrderNos
+            // Extract unique OrderNos (handle both CSV formats)
             var uniqueOrderNos = [];
             var orderNoMap = {};
 
             for (var i = 0; i < rows.length; i++) {
-                var orderNo = rows[i].OrderNo;
+                // Try both column names
+                var orderNo = rows[i].OrderNo || rows[i]['Invoice Number'];
+
                 if (orderNo && !orderNoMap[orderNo]) {
                     orderNoMap[orderNo] = true;
                     uniqueOrderNos.push(orderNo);
@@ -416,7 +636,8 @@ define(['N/search', 'N/log', 'N/file', 'N/record', 'N/email', 'N/runtime'], func
             log.audit('CSV Parsing Complete', {
                 totalRows: rows.length,
                 uniqueOrderNos: uniqueOrderNos.length,
-                fileName: fileObj.name
+                fileName: fileObj.name,
+                headerRowIndex: headerRowIndex
             });
 
             return {
