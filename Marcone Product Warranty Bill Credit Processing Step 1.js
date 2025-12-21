@@ -1403,7 +1403,7 @@ define(['N/search', 'N/log', 'N/file', 'N/record', 'N/https', 'N/email', 'N/runt
                         var valueElement = allTextElements[j];
                         if (Math.abs(valueElement.y - element.y) < 2 && valueElement.x > element.x) {
                             // Check if it starts with 6 and looks like an invoice number pattern
-                            if (/^6\d{7,8}$/.test(valueElement.text)) {
+                            if (/^[67]\d{7}$/ .test(valueElement.text)) {
                                 invoiceNumber = valueElement.text;
                                 log.debug('Invoice Number found', {
                                     invoiceNumber: invoiceNumber,
