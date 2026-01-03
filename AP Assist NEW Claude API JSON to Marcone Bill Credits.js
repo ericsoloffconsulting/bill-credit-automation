@@ -735,7 +735,7 @@ function (search, log, file, record, email, runtime) {
             var je = journalEntries[i];
 
             section += '\n' + (i + 1) + '. Journal Entry\n';
-            section += '   Transaction ID:  ' + je.journalEntryTranid + '\n';
+            section += '   Transaction ID:  ' + (je.tranid || 'N/A') + '\n';
             section += '   Internal ID:     ' + je.journalEntryId + '\n';
             section += '   URL:             ' + nsUrl + '/app/accounting/transactions/journal.nl?id=' +
                 je.journalEntryId + '\n';
