@@ -36,8 +36,10 @@ function (search, log, file, record, email, runtime) {
                 FOLDERS: {
                     JSON_SOURCE: configRecord.getValue('custrecord_ap_assist_json_folder_id'),
                     JSON_PROCESSED: configRecord.getValue('custrecord_ap_assist_json_processed_fold'),
-                    JSON_FAILED: configRecord.getValue('custrecord_ap_assist_json_skipped_fold'),
-                    PDF_UNPROCESSED: configRecord.getValue('custrecord_ap_asssist_pdf_folder_id')
+                    JSON_SKIPPED: configRecord.getValue('custrecord_ap_assist_json_skipped_fold'),
+                    PDF_UNPROCESSED: configRecord.getValue('custrecord_ap_asssist_pdf_folder_id'),
+                    PDF_PROCESSED: configRecord.getValue('custrecord_ap_assist_pdf_processed_fold'),
+                    PDF_SKIPPED: configRecord.getValue('custrecord_ap_assist_pdf_skipped_fold')
                 },
                 ACCOUNTS: {
                     ACCOUNTS_PAYABLE: 111,     // Journal Entry debit line
@@ -110,7 +112,12 @@ function (search, log, file, record, email, runtime) {
 
                 var result = processJSONFile(jsonFile);
                 
-                if (result.success) {
+                // Check if file only created skipped transactions (no actual JEs or VCs)
+                var hasOnlySkippedTransactions = result.success && 
+                    (result.journalEntriesCreated === 0 && result.vendorCreditsCreated === 0) &&
+                    (result.skippedTransactions > 0);
+                
+                if (result.success && !hasOnlySkippedTransactions) {
                     stats.filesProcessed++;
                     if (result.journalEntriesCreated) {
                         stats.journalEntriesCreated += result.journalEntriesCreated;
@@ -131,20 +138,91 @@ function (search, log, file, record, email, runtime) {
                         stats.skippedEntries = stats.skippedEntries.concat(result.details.skippedTransactions);
                     }
                     
-                    // Move to processed folder
+                    // Move to processed folder (JSON only - PDF stays attached to transaction)
                     moveFileToFolder(jsonFile.id, CONFIG.FOLDERS.JSON_PROCESSED);
                     
-                } else if (result.isSkipped) {
+                    // Move corresponding PDF to processed folder
+                    if (result.details && result.details.pdfFileId) {
+                        moveFileToFolder(result.details.pdfFileId, CONFIG.FOLDERS.PDF_PROCESSED);
+                        log.debug('Moved PDF to processed folder', {
+                            jsonFileName: jsonFile.name,
+                            pdfFileId: result.details.pdfFileId
+                        });
+                    } else {
+                        // Try to find PDF even if not in result
+                        var pdfFileId = findMatchingPDFFile(jsonFile.name, CONFIG.FOLDERS.PDF_UNPROCESSED);
+                        if (pdfFileId) {
+                            moveFileToFolder(pdfFileId, CONFIG.FOLDERS.PDF_PROCESSED);
+                            log.debug('Moved PDF to processed folder (found separately)', {
+                                jsonFileName: jsonFile.name,
+                                pdfFileId: pdfFileId
+                            });
+                        }
+                    }
+                    
+                } else if (result.isSkipped || hasOnlySkippedTransactions) {
                     stats.filesSkipped++;
-                    stats.skippedFiles.push(result);
-                    // Keep in source folder for review
+                    
+                    // Add skipped transaction details to email
+                    if (hasOnlySkippedTransactions && result.details && result.details.skippedTransactions) {
+                        stats.skippedEntries = stats.skippedEntries.concat(result.details.skippedTransactions);
+                    }
+                    
+                    // Determine skip reason
+                    var skipReason = result.skipReason || 'File skipped during processing';
+                    if (hasOnlySkippedTransactions && result.details && result.details.skippedTransactions && result.details.skippedTransactions.length > 0) {
+                        // Use the skip reason from the first skipped transaction
+                        skipReason = result.details.skippedTransactions[0].skipReason || 'All transactions were skipped';
+                    }
+                    
+                    stats.skippedFiles.push({
+                        fileName: result.fileName,
+                        skipReason: skipReason,
+                        skippedTransactions: result.skippedTransactions || 0
+                    });
+                    
+                    // Add skip reason to JSON file and move to skipped folder
+                    var skipMetadata = {
+                        processingStatus: 'SKIPPED',
+                        skipReason: skipReason,
+                        processedDate: new Date().toISOString(),
+                        originalFileName: result.fileName,
+                        skippedTransactionCount: result.skippedTransactions || 0
+                    };
+                    addMetadataToJSONAndMove(jsonFile.id, skipMetadata, CONFIG.FOLDERS.JSON_SKIPPED);
+                    
+                    // Move corresponding PDF to skipped folder
+                    var pdfFileId = findMatchingPDFFile(jsonFile.name, CONFIG.FOLDERS.PDF_UNPROCESSED);
+                    if (pdfFileId) {
+                        moveFileToFolder(pdfFileId, CONFIG.FOLDERS.PDF_SKIPPED);
+                        log.debug('Moved PDF to skipped folder', {
+                            jsonFileName: jsonFile.name,
+                            pdfFileId: pdfFileId
+                        });
+                    }
                     
                 } else {
                     stats.filesFailed++;
                     stats.failedFiles.push(result);
                     
-                    // Move to failed folder
-                    moveFileToFolder(jsonFile.id, CONFIG.FOLDERS.JSON_FAILED);
+                    // Add error details to JSON file and move to skipped folder (same as skipped)
+                    var failMetadata = {
+                        processingStatus: 'FAILED',
+                        error: result.error || 'Unknown error during processing',
+                        processedDate: new Date().toISOString(),
+                        originalFileName: result.fileName
+                    };
+                    addMetadataToJSONAndMove(jsonFile.id, failMetadata, CONFIG.FOLDERS.JSON_SKIPPED);
+                    
+                    // Move corresponding PDF to skipped folder
+                    var pdfFileId = findMatchingPDFFile(jsonFile.name, CONFIG.FOLDERS.PDF_UNPROCESSED);
+                    if (pdfFileId) {
+                        moveFileToFolder(pdfFileId, CONFIG.FOLDERS.PDF_SKIPPED);
+                        log.debug('Moved PDF to skipped folder (failed)', {
+                            jsonFileName: jsonFile.name,
+                            pdfFileId: pdfFileId
+                        });
+                    }
                 }
             }
 
@@ -252,7 +330,7 @@ function (search, log, file, record, email, runtime) {
             }
 
             // Call transaction creation orchestrator
-            var transactionResult = createJournalEntriesFromLineItems(splitPart, jsonFile.id);
+            var transactionResult = createJournalEntriesFromLineItems(splitPart, jsonFile.id, CONFIG);
 
             if (transactionResult.success) {
                 return {
@@ -263,7 +341,8 @@ function (search, log, file, record, email, runtime) {
                     journalEntriesCreated: transactionResult.journalEntries ? transactionResult.journalEntries.length : 0,
                     vendorCreditsCreated: transactionResult.vendorCredits ? transactionResult.vendorCredits.length : 0,
                     skippedTransactions: transactionResult.skippedTransactions ? transactionResult.skippedTransactions.length : 0,
-                    details: transactionResult
+                    details: transactionResult,
+                    pdfFileId: splitPart.pdfFileId
                 };
             } else {
                 return {
@@ -409,6 +488,60 @@ function (search, log, file, record, email, runtime) {
                 fileId: fileId,
                 targetFolderId: targetFolderId
             });
+            return false;
+        }
+    }
+
+    function addMetadataToJSONAndMove(fileId, metadata, targetFolderId) {
+        try {
+            // Load the JSON file
+            var fileObj = file.load({ id: fileId });
+            var fileContent = fileObj.getContents();
+            
+            // Parse existing JSON
+            var jsonData = JSON.parse(fileContent);
+            
+            // Add processing metadata
+            jsonData._processingMetadata = metadata;
+            
+            // Convert back to JSON string with formatting
+            var updatedContent = JSON.stringify(jsonData, null, 2);
+            
+            // Create new file with updated content in target folder
+            var newFile = file.create({
+                name: fileObj.name,
+                fileType: file.Type.JSON,
+                contents: updatedContent,
+                folder: targetFolderId
+            });
+            var newFileId = newFile.save();
+            
+            // Delete original file
+            file.delete({ id: fileId });
+            
+            log.debug('JSON file updated with metadata and moved', {
+                originalFileId: fileId,
+                newFileId: newFileId,
+                targetFolderId: targetFolderId,
+                metadata: JSON.stringify(metadata)
+            });
+            
+            return newFileId;
+            
+        } catch (error) {
+            log.error('Error adding metadata to JSON and moving', {
+                error: error.toString(),
+                fileId: fileId,
+                targetFolderId: targetFolderId
+            });
+            
+            // Fallback: just move the file without editing
+            try {
+                moveFileToFolder(fileId, targetFolderId);
+            } catch (moveError) {
+                log.error('Fallback move also failed', { error: moveError.toString() });
+            }
+            
             return false;
         }
     }
@@ -621,11 +754,40 @@ function (search, log, file, record, email, runtime) {
             if (je.totalAmount) {
                 section += '   Total Amount:    ' + formatCurrency(je.totalAmount) + '\n';
             }
+            
+            // Show documentTotal from PDF if available
+            if (je.extractedData && je.extractedData.documentTotal) {
+                section += '   Document Total:  ' + je.extractedData.documentTotal + '\n';
+            }
+            
+            // Show delivery amount from PDF
+            if (je.extractedData && je.extractedData.deliveryAmount) {
+                section += '   Delivery Amount: ' + je.extractedData.deliveryAmount + '\n';
+            }
 
             // Show PDF file link if available
             if (je.pdfFileId) {
-                section += '   PDF File URL:    ' + nsUrl + '/app/common/media/mediaitem.nl?id=' +
-                    je.pdfFileId + '\n';
+                try {
+                    var pdfFile = file.load({ id: je.pdfFileId });
+                    var pdfUrl = 'https://system.netsuite.com' + pdfFile.url;
+                    section += '   PDF File URL:    ' + pdfUrl + '\n';
+                    log.debug('Adding PDF URL to JE email section', {
+                        journalEntryId: je.journalEntryId,
+                        pdfFileId: je.pdfFileId,
+                        pdfUrl: pdfUrl
+                    });
+                } catch (e) {
+                    log.error('Error loading PDF file for URL', {
+                        journalEntryId: je.journalEntryId,
+                        pdfFileId: je.pdfFileId,
+                        error: e.toString()
+                    });
+                }
+            } else {
+                log.debug('No PDF file ID for JE', {
+                    journalEntryId: je.journalEntryId,
+                    jeObject: JSON.stringify(je)
+                });
             }
         }
 
@@ -684,6 +846,16 @@ function (search, log, file, record, email, runtime) {
             if (vc.totalAmount) {
                 section += '   Total Amount:          ' + formatCurrency(vc.totalAmount) + '\n';
             }
+            
+            // Show documentTotal from PDF if available
+            if (vc.extractedData && vc.extractedData.documentTotal) {
+                section += '   Document Total:        ' + vc.extractedData.documentTotal + '\n';
+            }
+            
+            // Show delivery amount from PDF
+            if (vc.extractedData && vc.extractedData.deliveryAmount) {
+                section += '   Delivery Amount:       ' + vc.extractedData.deliveryAmount + '\n';
+            }
 
             // Add VRMA reference if available
             if (vc.matchingVRMA) {
@@ -695,8 +867,27 @@ function (search, log, file, record, email, runtime) {
 
             // Show PDF file link if available
             if (vc.pdfFileId) {
-                section += '   PDF File URL:           ' + nsUrl + '/app/common/media/mediaitem.nl?id=' +
-                    vc.pdfFileId + '\n';
+                try {
+                    var pdfFile = file.load({ id: vc.pdfFileId });
+                    var pdfUrl = 'https://system.netsuite.com' + pdfFile.url;
+                    section += '   PDF File URL:           ' + pdfUrl + '\n';
+                    log.debug('Adding PDF URL to VC email section', {
+                        vendorCreditId: vc.vendorCreditId,
+                        pdfFileId: vc.pdfFileId,
+                        pdfUrl: pdfUrl
+                    });
+                } catch (e) {
+                    log.error('Error loading PDF file for URL', {
+                        vendorCreditId: vc.vendorCreditId,
+                        pdfFileId: vc.pdfFileId,
+                        error: e.toString()
+                    });
+                }
+            } else {
+                log.debug('No PDF file ID for VC', {
+                    vendorCreditId: vc.vendorCreditId,
+                    vcObject: JSON.stringify(vc)
+                });
             }
         }
 
@@ -706,6 +897,10 @@ function (search, log, file, record, email, runtime) {
     function buildSkippedTransactionsSection(skippedEntries) {
         var section = 'SKIPPED TRANSACTIONS (Manual Processing Required)\n';
         section += '-'.repeat(50) + '\n';
+
+        // Get NetSuite domain for URLs
+        var domain = runtime.accountId.toLowerCase().replace('_', '-');
+        var nsUrl = 'https://' + domain + '.app.netsuite.com';
 
         // Group by skip type
         var skipGroups = {};
@@ -745,6 +940,40 @@ function (search, log, file, record, email, runtime) {
                 }
 
                 section += '\n    Reason: ' + entry.skipReason + '\n';
+                
+                // Add PDF file link if available
+                if (entry.pdfFileId) {
+                    try {
+                        var pdfFile = file.load({ id: entry.pdfFileId });
+                        var pdfUrl = 'https://system.netsuite.com' + pdfFile.url;
+                        section += '    PDF URL: ' + pdfUrl + '\n';
+                        log.debug('Adding PDF URL to skipped transaction email section', {
+                            skipType: entry.skipType,
+                            nardaNumber: entry.nardaNumber,
+                            pdfFileId: entry.pdfFileId,
+                            fileName: entry.fileName,
+                            pdfUrl: pdfUrl
+                        });
+                    } catch (e) {
+                        log.error('Error loading PDF file for URL', {
+                            skipType: entry.skipType,
+                            pdfFileId: entry.pdfFileId,
+                            error: e.toString()
+                        });
+                    }
+                } else {
+                    log.debug('No PDF file ID for skipped transaction', {
+                        skipType: entry.skipType,
+                        nardaNumber: entry.nardaNumber,
+                        fileName: entry.fileName,
+                        entryObject: JSON.stringify(entry)
+                    });
+                }
+                
+                // Add filename for reference
+                if (entry.fileName) {
+                    section += '    File: ' + entry.fileName + '\n';
+                }
             }
         }
 
@@ -769,10 +998,28 @@ function (search, log, file, record, email, runtime) {
         section += '-'.repeat(50) + '\n';
 
         for (var i = 0; i < failedFiles.length; i++) {
-            var file = failedFiles[i];
+            var fileEntry = failedFiles[i];
 
-            section += '\n' + (i + 1) + '. File: ' + file.fileName + '\n';
-            section += '   Error: ' + file.error + '\n';
+            section += '\n' + (i + 1) + '. File: ' + fileEntry.fileName + '\n';
+            section += '   Error: ' + fileEntry.error + '\n';
+            
+            // Try to get PDF URL if available
+            if (fileEntry.fileName) {
+                try {
+                    var CONFIG = loadConfiguration();
+                    var pdfFileId = findMatchingPDFFile(fileEntry.fileName, CONFIG.FOLDERS.PDF_UNPROCESSED);
+                    if (pdfFileId) {
+                        var pdfFile = file.load({ id: pdfFileId });
+                        var pdfUrl = 'https://system.netsuite.com' + pdfFile.url;
+                        section += '   PDF URL: ' + pdfUrl + '\n';
+                    }
+                } catch (e) {
+                    log.debug('Could not get PDF URL for failed file', {
+                        fileName: fileEntry.fileName,
+                        error: e.toString()
+                    });
+                }
+            }
         }
 
         return section;
@@ -838,7 +1085,7 @@ function (search, log, file, record, email, runtime) {
     // (UNCHANGED FROM ORIGINAL - Lines 2596-7083)
     // ===========================
 
-    function createJournalEntriesFromLineItems(splitPart, recordId) {
+    function createJournalEntriesFromLineItems(splitPart, recordId, CONFIG) {
         try {
             // Get extracted line items from JSON results
             var extractedData = null;
@@ -902,7 +1149,9 @@ function (search, log, file, record, email, runtime) {
                         skipType: 'SHORT_SHIP',
                         nardaNumber: nardaNumber,
                         totalAmount: nardaGroup.totalAmount,
-                        extractedData: extractedData
+                        extractedData: extractedData,
+                        pdfFileId: splitPart.pdfFileId,
+                        fileName: splitPart.fileName
                     });
                 } else {
                     // Unidentified NARDA value - skip for manual review
@@ -920,7 +1169,9 @@ function (search, log, file, record, email, runtime) {
                         skipType: 'UNIDENTIFIED_NARDA',
                         nardaNumber: nardaNumber,
                         totalAmount: nardaGroup.totalAmount,
-                        extractedData: extractedData
+                        extractedData: extractedData,
+                        pdfFileId: splitPart.pdfFileId,
+                        fileName: splitPart.fileName
                     });
                 }
             }
@@ -942,6 +1193,12 @@ function (search, log, file, record, email, runtime) {
                         skippedTransactions.push(consolidatedResult);
                     } else {
                         journalEntryResults.push(consolidatedResult);
+                        log.debug('Added consolidated JE to results array', {
+                            journalEntryId: consolidatedResult.journalEntryId,
+                            pdfFileId: consolidatedResult.pdfFileId,
+                            hasPdfFileId: !!consolidatedResult.pdfFileId,
+                            resultObject: JSON.stringify(consolidatedResult)
+                        });
                     }
                 } else {
                     // Handle consolidation failure
@@ -954,7 +1211,9 @@ function (search, log, file, record, email, runtime) {
                             nardaNumber: 'Multiple: ' + journalEntryGroups.map(function (g) { return g.nardaNumber; }).join(', '),
                             totalAmount: journalEntryGroups.reduce(function (sum, g) { return sum + g.nardaGroup.totalAmount; }, 0),
                             extractedData: extractedData,
-                            existingJournalEntry: consolidatedResult.existingJournalEntry
+                            existingJournalEntry: consolidatedResult.existingJournalEntry,
+                            pdfFileId: splitPart.pdfFileId,
+                            fileName: splitPart.fileName
                         });
                     } else {
                         return {
@@ -974,13 +1233,20 @@ function (search, log, file, record, email, runtime) {
                     recordId: recordId
                 });
 
-                var jeResult = createJournalEntryFromNardaGroup(splitPart, recordId, extractedData, singleGroup.nardaGroup, singleGroup.nardaNumber);
+                var jeResult = createJournalEntryFromNardaGroup(splitPart, recordId, extractedData, singleGroup.nardaGroup, singleGroup.nardaNumber, CONFIG);
 
                 if (jeResult.success) {
                     if (jeResult.isSkipped) {
                         skippedTransactions.push(jeResult);
                     } else {
                         journalEntryResults.push(jeResult);
+                        log.debug('Added single NARDA JE to results array', {
+                            journalEntryId: jeResult.journalEntryId,
+                            nardaNumber: singleGroup.nardaNumber,
+                            pdfFileId: jeResult.pdfFileId,
+                            hasPdfFileId: !!jeResult.pdfFileId,
+                            resultObject: JSON.stringify(jeResult)
+                        });
                     }
                 } else {
                     // Journal entry creation failed
@@ -993,7 +1259,9 @@ function (search, log, file, record, email, runtime) {
                             nardaNumber: singleGroup.nardaNumber,
                             totalAmount: singleGroup.nardaGroup.totalAmount,
                             extractedData: extractedData,
-                            existingJournalEntry: jeResult.existingJournalEntry
+                            existingJournalEntry: jeResult.existingJournalEntry,
+                            pdfFileId: splitPart.pdfFileId,
+                            fileName: splitPart.fileName
                         });
                     } else {
                         return {
@@ -1054,7 +1322,7 @@ function (search, log, file, record, email, runtime) {
 
                     if (vcResult.success) {
                         if (vcResult.isVendorCredit) {
-                            vendorCreditResults.push({
+                            var vcResultObj = {
                                 success: true,
                                 isVendorCredit: true,
                                 vendorCreditId: vcResult.vendorCreditId,
@@ -1066,15 +1334,21 @@ function (search, log, file, record, email, runtime) {
                                 originalBillNumber: billNumber,
                                 matchingVRMA: vcResult.matchingVRMA,
                                 extractedData: extractedData,
-                                attachmentResult: vcResult.attachmentResult
-                            });
+                                attachmentResult: vcResult.attachmentResult,
+                                pdfFileId: splitPart.pdfFileId,
+                                fileName: splitPart.fileName
+                            };
+                            vendorCreditResults.push(vcResultObj);
 
-                            log.debug('Vendor credit created successfully', {
+                            log.debug('Vendor credit created successfully - added to results array', {
                                 vendorCreditId: vcResult.vendorCreditId,
                                 billNumber: billNumber,
                                 nardaTypes: billGroup.nardaTypes,
                                 combinedNarda: consolidatedNardaGroup.nardaNumber,
-                                fileName: splitPart.fileName
+                                pdfFileId: splitPart.pdfFileId,
+                                hasPdfFileId: !!splitPart.pdfFileId,
+                                fileName: splitPart.fileName,
+                                vcResultObj: JSON.stringify(vcResultObj)
                             });
                         } else if (vcResult.isSkipped) {
                             skippedTransactions.push({
@@ -1087,7 +1361,9 @@ function (search, log, file, record, email, runtime) {
                                 totalAmount: billGroup.totalAmount,
                                 originalBillNumber: billNumber,
                                 extractedData: extractedData,
-                                matchingVRMA: vcResult.matchingVRMA
+                                matchingVRMA: vcResult.matchingVRMA,
+                                pdfFileId: splitPart.pdfFileId,
+                                fileName: splitPart.fileName
                             });
                         }
                     } else {
@@ -1103,7 +1379,9 @@ function (search, log, file, record, email, runtime) {
                                 totalAmount: billGroup.totalAmount,
                                 originalBillNumber: billNumber,
                                 extractedData: extractedData,
-                                existingVendorCredit: vcResult.existingVendorCredit
+                                existingVendorCredit: vcResult.existingVendorCredit,
+                                pdfFileId: splitPart.pdfFileId,
+                                fileName: splitPart.fileName
                             });
                         } else {
                             return {
@@ -1129,7 +1407,9 @@ function (search, log, file, record, email, runtime) {
                         nardaTypes: billGroup.nardaTypes,
                         totalAmount: billGroup.totalAmount,
                         originalBillNumber: billNumber,
-                        extractedData: extractedData
+                        extractedData: extractedData,
+                        pdfFileId: splitPart.pdfFileId,
+                        fileName: splitPart.fileName
                     });
                 }
             }
@@ -1576,7 +1856,9 @@ function (search, log, file, record, email, runtime) {
                             skipType: 'NO_MATCHING_OPEN_INVOICE',
                             nardaNumber: nardaNumber,
                             totalAmount: nardaGroup.totalAmount,
-                            extractedData: extractedData
+                            extractedData: extractedData,
+                            pdfFileId: splitPart.pdfFileId,
+                            fileName: splitPart.fileName
                         };
                     } else {
                         log.error('Could not find Credit Line Entity due to error', {
@@ -1666,7 +1948,8 @@ function (search, log, file, record, email, runtime) {
                 attachmentResult: attachResult,
                 nardaGroups: nardaNumbers,
                 grandTotal: grandTotal,
-                pdfFileId: splitPart.pdfFileId
+                pdfFileId: splitPart.pdfFileId,
+                extractedData: extractedData
             };
 
         } catch (error) {
@@ -1682,7 +1965,7 @@ function (search, log, file, record, email, runtime) {
         }
     }
 
-    function createJournalEntryFromNardaGroup(splitPart, recordId, extractedData, nardaGroup, nardaNumber) {
+    function createJournalEntryFromNardaGroup(splitPart, recordId, extractedData, nardaGroup, nardaNumber, CONFIG) {
         try {
             log.debug('Creating journal entry from NARDA group', {
                 nardaNumber: nardaNumber,
@@ -1724,6 +2007,22 @@ function (search, log, file, record, email, runtime) {
 
             // Create memo
             var memo = 'MARCONE CM' + extractedData.invoiceNumber + ' ' + nardaNumber;
+            
+            // Collect sales order numbers from line items
+            var salesOrderNumbers = [];
+            if (nardaGroup.lineItems) {
+                for (var i = 0; i < nardaGroup.lineItems.length; i++) {
+                    var lineItem = nardaGroup.lineItems[i];
+                    if (lineItem.salesOrderNumber && salesOrderNumbers.indexOf(lineItem.salesOrderNumber) === -1) {
+                        salesOrderNumbers.push(lineItem.salesOrderNumber);
+                    }
+                }
+            }
+            
+            // Append sales order numbers to memo if present
+            if (salesOrderNumbers.length > 0) {
+                memo += ' | SOs: ' + salesOrderNumbers.join(', ');
+            }
 
             // Find Credit Line Entity based on NARDA number
             var creditLineEntity = findCreditLineEntity(nardaNumber, recordId);
@@ -1742,7 +2041,9 @@ function (search, log, file, record, email, runtime) {
                         skipType: 'NO_MATCHING_OPEN_INVOICE',
                         nardaNumber: nardaNumber,
                         totalAmount: nardaGroup.totalAmount,
-                        extractedData: extractedData
+                        extractedData: extractedData,
+                        pdfFileId: splitPart.pdfFileId,
+                        fileName: splitPart.fileName
                     };
                 } else {
                     log.error('Could not find Credit Line Entity due to error', {
@@ -1878,7 +2179,8 @@ function (search, log, file, record, email, runtime) {
                 nardaGroups: [nardaNumber],
                 totalAmount: nardaGroup.totalAmount,
                 attachmentResult: attachResult,
-                pdfFileId: splitPart.pdfFileId
+                pdfFileId: splitPart.pdfFileId,
+                extractedData: extractedData
             };
 
         } catch (error) {
@@ -1924,7 +2226,9 @@ function (search, log, file, record, email, runtime) {
                     skipReason: nardaGroup.nardaNumber + ' NARDA - no line items found for original bill number: ' + originalBillNumber,
                     skipType: 'NO_MATCHING_LINE_ITEMS',
                     nardaNumber: nardaGroup.nardaNumber,
-                    extractedData: extractedData
+                    extractedData: extractedData,
+                    pdfFileId: splitPart.pdfFileId,
+                    fileName: splitPart.fileName
                 };
             }
 
@@ -1946,7 +2250,9 @@ function (search, log, file, record, email, runtime) {
                     skipReason: nardaGroup.nardaNumber + ' NARDA - no VRMA lines found containing bill number: ' + originalBillNumber,
                     skipType: 'NO_VRMA_MATCH',
                     nardaNumber: nardaGroup.nardaNumber,
-                    extractedData: extractedData
+                    extractedData: extractedData,
+                    pdfFileId: splitPart.pdfFileId,
+                    fileName: splitPart.fileName
                 };
             }
 
@@ -2054,7 +2360,9 @@ function (search, log, file, record, email, runtime) {
                     skipType: 'ALL_VRMA_ATTEMPTS_FAILED',
                     nardaNumber: nardaGroup.nardaNumber,
                     extractedData: extractedData,
-                    VRMAAttemptsCount: VRMAIds.length
+                    VRMAAttemptsCount: VRMAIds.length,
+                    pdfFileId: splitPart.pdfFileId,
+                    fileName: splitPart.fileName
                 };
             }
 
@@ -2187,10 +2495,11 @@ function (search, log, file, record, email, runtime) {
             VRMALineCount: VRMALines.length
         });
 
-        // Try to match each PDF line to a VRMA line by amount
+        // Try to match each PDF line to a VRMA line by amount AND part number
         for (var i = 0; i < pdfLines.length; i++) {
             var pdfLine = pdfLines[i];
             var pdfAmount = Math.abs(parseFloat(pdfLine.totalAmount.replace(/[()$,-]/g, '')));
+            var pdfPartNumber = pdfLine.partNumber || '';
 
             // Find matching VRMA line that hasn't been used
             for (var j = 0; j < VRMALines.length; j++) {
@@ -2204,7 +2513,24 @@ function (search, log, file, record, email, runtime) {
                 var VRMAAmount = Math.abs(parseFloat(VRMALine.amount));
 
                 // Check if amounts match within tolerance
-                if (Math.abs(VRMAAmount - pdfAmount) < 0.01) {
+                var amountMatches = Math.abs(VRMAAmount - pdfAmount) < 0.01;
+                
+                // Check if part numbers match (if PDF has part number)
+                var partNumberMatches = true;
+                if (pdfPartNumber && VRMALine.itemName) {
+                    // Item name is already available from search results - no lookup needed!
+                    partNumberMatches = VRMALine.itemName === pdfPartNumber;
+                    
+                    log.debug('Part number comparison', {
+                        pdfPartNumber: pdfPartNumber,
+                        VRMAItemName: VRMALine.itemName,
+                        matches: partNumberMatches,
+                        note: 'Using itemName from search results - no additional lookup needed'
+                    });
+                }
+
+                // Match if both amount AND part number match
+                if (amountMatches && partNumberMatches) {
                     matchedPairs.push({
                         pdfLine: pdfLine,
                         VRMALine: VRMALine,
@@ -2216,6 +2542,7 @@ function (search, log, file, record, email, runtime) {
                     log.debug('Matched PDF line to VRMA line', {
                         pdfAmount: pdfAmount,
                         VRMAAmount: VRMAAmount,
+                        pdfPartNumber: pdfPartNumber,
                         VRMALineNumber: VRMALine.lineNumber,
                         originalBillNumber: originalBillNumber
                     });
@@ -2323,7 +2650,9 @@ function (search, log, file, record, email, runtime) {
                             internalId: VRMAInternalId,
                             tranid: VRMATransactionId,
                             status: statusText
-                        }
+                        },
+                        pdfFileId: splitPart.pdfFileId,
+                        fileName: splitPart.fileName
                     };
                 }
 
@@ -2341,7 +2670,9 @@ function (search, log, file, record, email, runtime) {
                     skipType: 'VRMA_ACCESS_ERROR',
                     nardaNumber: nardaGroup.nardaNumber,
                     extractedData: extractedData,
-                    VRMAAccessError: VRMALoadError.toString()
+                    VRMAAccessError: VRMALoadError.toString(),
+                    pdfFileId: splitPart.pdfFileId,
+                    fileName: splitPart.fileName
                 };
             }
 
@@ -2414,6 +2745,20 @@ function (search, log, file, record, email, runtime) {
             // Set memo
             var nardaTypesList = nardaGroup.allNardaTypes ? nardaGroup.allNardaTypes.join('+') : nardaGroup.nardaNumber.toUpperCase();
             var vcMemo = nardaTypesList + ' Credit - ' + extractedData.invoiceNumber + ' - Bill: ' + originalBillNumber + ' - VRMA: ' + VRMARecord.getValue('tranid');
+            
+            // Collect sales order numbers from matched pairs
+            var salesOrderNumbers = [];
+            for (var i = 0; i < matchedPairs.length; i++) {
+                var pdfLine = matchedPairs[i].pdfLine;
+                if (pdfLine.salesOrderNumber && salesOrderNumbers.indexOf(pdfLine.salesOrderNumber) === -1) {
+                    salesOrderNumbers.push(pdfLine.salesOrderNumber);
+                }
+            }
+            
+            // Append sales order numbers to memo if present
+            if (salesOrderNumbers.length > 0) {
+                vcMemo += ' | SOs: ' + salesOrderNumbers.join(', ');
+            }
 
             vendorCredit.setValue({
                 fieldId: 'memo',
@@ -2613,7 +2958,8 @@ function (search, log, file, record, email, runtime) {
                         memo: lineMemo,
                         entity: result.getValue('entity'),
                         status: result.getValue('status'),
-                        lineItem: result.getValue('item'),
+                        itemId: result.getValue('item'),
+                        itemName: result.getText('item'),  // Get item name for part number validation
                         amount: result.getValue('amount'),
                         lineNumber: result.getValue('line')
                     });
@@ -2623,6 +2969,7 @@ function (search, log, file, record, email, runtime) {
                         VRMATransactionId: result.getValue('tranid'),
                         lineNumber: result.getValue('line'),
                         lineMemo: lineMemo,
+                        itemName: result.getText('item'),
                         amount: result.getValue('amount'),
                         originalBillNumber: originalBillNumber
                     });
